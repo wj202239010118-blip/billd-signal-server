@@ -1,0 +1,16 @@
+{
+  "name": "billd-signal-server",
+  "version": "1.0.0",
+  "description": "极简 WebRTC 信令服务器，为 billd-desk 提供设备发现和 WebRTC 协商",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
