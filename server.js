@@ -154,6 +154,26 @@ io.on('connection', (socket) => {
     relayToRoom(receiver, 'billdDeskCandidate', payload, socket.id);
   });
 
+  // ── 文件传输信令（ft-*）：点对点转发 ───────────────────────────────────
+  // 所有文件传输信令消息结构：{ type: 'ft-xxx', to: targetUuid, from: myUuid, ... }
+  socket.on('fileTransfer', (payload) => {
+    const { to } = payload;
+    if (!to) return;
+    log(`fileTransfer ${payload.type} → ${to}`);
+    // 转发给目标 UUID 对应房间的所有成员
+    relayToRoom(to, 'fileTransfer', payload, socket.id);
+  });
+
+  // ftJoin：文件传输专用房间加入
+  socket.on('ftJoin', (payload) => {
+    const { uuid } = payload || {};
+    if (!uuid) return;
+    socket.join(uuid);
+    if (!rooms.has(uuid)) rooms.set(uuid, new Set());
+    rooms.get(uuid).add(socket.id);
+    log(`ftJoin → room:${uuid}`);
+  });
+
   // ── heartbeat：保活 ────────────────────────────────────────────────────
   socket.on('heartbeat', (payload) => {
     socket.emit('heartbeat', { request_id: payload?.request_id, time: Date.now(), data: {} });
