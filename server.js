@@ -35,6 +35,8 @@ const io = new Server(httpServer, {
 
 // roomId → Set<socketId>  内存中维护房间成员
 const rooms = new Map();
+// deskUserUuid → socketId  用于 billdDeskStartRemote 路由
+const uuidSocketMap = new Map();
 
 function log(msg, ...args) {
   console.log(`[${new Date().toLocaleTimeString()}] ${msg}`, ...args);
@@ -86,34 +88,64 @@ io.on('connection', (socket) => {
   });
 
   // ── billdDeskJoin：远程桌面客户端加入 ────────────────────────────────────
+  // 客户端发送格式：{ data: { deskUserUuid, deskUserPassword, live_room_id } }
   socket.on('billdDeskJoin', (payload) => {
-    const { uuid } = payload.data || {};
-    if (!uuid) return;
-    socket.join(uuid);
-    if (!rooms.has(uuid)) rooms.set(uuid, new Set());
-    rooms.get(uuid).add(socket.id);
-    log(`billdDeskJoin → room:${uuid}, socket:${socket.id}`);
+    const d = payload.data || {};
+    // 兼容 uuid / deskUserUuid / live_room_id 三种字段名
+    const roomId = d.deskUserUuid || d.uuid || d.live_room_id;
+    if (!roomId) {
+      log('billdDeskJoin 缺少 roomId', JSON.stringify(d));
+      return;
+    }
+    socket.join(roomId);
+    if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+    rooms.get(roomId).add(socket.id);
+    // 记录 deskUserUuid → socketId 映射，供 billdDeskStartRemote 路由用
+    socket._deskUserUuid = roomId;
+    uuidSocketMap.set(roomId, socket.id);
+    log(`billdDeskJoin → room:${roomId}, socket:${socket.id}`);
 
     socket.emit('billdDeskJoined', {
       request_id: payload.request_id,
       time: Date.now(),
-      data: { uuid },
+      data: { live_room_id: roomId, uuid: roomId },
     });
   });
 
   // ── billdDeskStartRemote：控制端发起连接请求 → 转发给被控端 ───────────────
+  // 客户端发送格式：{ data: { receiver: '', remoteDeskUserUuid, sender, ... } }
   socket.on('billdDeskStartRemote', (payload) => {
-    const { receiver } = payload.data || {};
-    log(`billdDeskStartRemote sender→receiver:${receiver}`);
-    // 把请求发给被控端（以被控端 UUID 为房间）
-    relayToRoom(receiver, 'billdDeskStartRemote', payload, socket.id);
+    const d = payload.data || {};
+    const targetUuid = d.remoteDeskUserUuid;
+    const targetSocketId = uuidSocketMap.get(targetUuid);
+    log(`billdDeskStartRemote → remoteDeskUserUuid:${targetUuid} socketId:${targetSocketId}`);
+    if (!targetSocketId) {
+      // 被控端不在线，告知控制端
+      socket.emit('billdDeskStartRemoteResult', {
+        request_id: payload.request_id,
+        time: Date.now(),
+        data: { code: 1, msg: '目标设备不在线', data: d },
+      });
+      return;
+    }
+    // 把请求转发给被控端，附上控制端的真实 socketId 作为 receiver
+    io.to(targetSocketId).emit('billdDeskStartRemote', {
+      ...payload,
+      data: { ...d, receiver: targetSocketId },
+    });
   });
 
   // ── billdDeskStartRemoteResult：被控端回复（接受/拒绝） → 转发给控制端 ────
   socket.on('billdDeskStartRemoteResult', (payload) => {
-    const { sender } = payload.data || {};
-    log(`billdDeskStartRemoteResult result→sender:${sender}`);
-    relayToRoom(sender, 'billdDeskStartRemoteResult', payload, socket.id);
+    const d = payload.data || {};
+    // 控制端的 socketId 在 data.data.sender 里
+    const ctrlSocketId = d.data?.sender;
+    log(`billdDeskStartRemoteResult code:${d.code} → ctrlSocket:${ctrlSocketId}`);
+    if (ctrlSocketId) {
+      io.to(ctrlSocketId).emit('billdDeskStartRemoteResult', payload);
+    }
+    // 同时也发给被控端自己（remote/index.vue 监听此事件更新 UI）
+    socket.emit('billdDeskStartRemoteResult', payload);
   });
 
   // ── billdDeskBehavior：鼠标/键盘行为 → 转发给被控端 ──────────────────────
@@ -187,6 +219,9 @@ io.on('connection', (socket) => {
         rooms.delete(roomId);
         log(`房间已清理: ${roomId}`);
       }
+    }
+    if (socket._deskUserUuid) {
+      uuidSocketMap.delete(socket._deskUserUuid);
     }
   });
 });
