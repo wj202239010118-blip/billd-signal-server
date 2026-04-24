@@ -114,6 +114,13 @@ io.on('connection', (socket) => {
     if (d.receiver) io.to(d.receiver).emit('billdDeskBehavior', d);
   });
 
+  // ── 主控端主动断开通知 → 转发给被控端 ────────────────────────────────────
+  socket.on('billdDeskClose', (payload) => {
+    const d = unwrap(payload);
+    log(`billdDeskClose sender=${d.sender} → receiver=${d.receiver}`);
+    if (d.receiver) io.to(d.receiver).emit('billdDeskClose', d);
+  });
+
   // ── 通用 join（兼容） ─────────────────────────────────────────────────────
   socket.on('join', (payload) => {
     const d = unwrap(payload);
