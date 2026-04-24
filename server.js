@@ -1,24 +1,12 @@
-/**
- * billd-desk 极简信令服务器
- *
- * 设计原则（借鉴 RustDesk）：
- * - 服务器只负责「转发消息」，不存储任何业务数据
- * - 密码校验在被控端本地完成，服务器不参与
- * - 无需数据库，纯内存，进程重启不影响客户端（会自动重连）
- *
- * 兼容 billd-desk 的 Socket.io 消息协议，客户端零改动
- */
-
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 4300;
 
 const httpServer = createServer((req, res) => {
-  // 健康检查端点（Railway 需要）
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', rooms: io.sockets.adapter.rooms.size }));
+    res.end(JSON.stringify({ status: 'ok', sockets: io.sockets.sockets.size }));
     return;
   }
   res.writeHead(200);
@@ -26,207 +14,129 @@ const httpServer = createServer((req, res) => {
 });
 
 const io = new Server(httpServer, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST'],
-  },
+  cors: { origin: '*', methods: ['GET', 'POST'] },
   transports: ['websocket', 'polling'],
 });
 
-// roomId → Set<socketId>  内存中维护房间成员
-const rooms = new Map();
-// deskUserUuid → socketId  用于 billdDeskStartRemote 路由
+// deskUserUuid → socketId
 const uuidSocketMap = new Map();
 
 function log(msg, ...args) {
   console.log(`[${new Date().toLocaleTimeString()}] ${msg}`, ...args);
 }
 
-// ─── 工具：向同一房间内的其他成员广播 ─────────────────────────────────────────
-function relayToRoom(roomId, eventName, payload, excludeSocketId) {
-  const members = rooms.get(roomId);
-  if (!members) return;
-  for (const sid of members) {
-    if (sid === excludeSocketId) continue;
-    io.to(sid).emit(eventName, payload);
-  }
-}
-
-// ─── 工具：向指定 receiver（UUID 对应的房间） 发消息 ──────────────────────────
-function relayToReceiver(receiverUuid, eventName, payload) {
-  const members = rooms.get(receiverUuid);
-  if (!members) {
-    log(`目标房间不存在: ${receiverUuid}`);
-    return;
-  }
-  for (const sid of members) {
-    io.to(sid).emit(eventName, payload);
-  }
+// 从 socket.io 消息中提取内层 data 字段
+// 客户端发送格式：{ request_id, socket_id, user_info, user_token, time, data: T }
+// 服务器转发时只发 T（内层 data），让客户端类型定义匹配
+function unwrap(payload) {
+  return payload?.data !== undefined ? payload.data : payload;
 }
 
 io.on('connection', (socket) => {
-  log(`客户端连接: ${socket.id}`);
+  log(`[+] ${socket.id}`);
 
-  // ── join：设备上线，加入以自己 UUID 为名的房间 ─────────────────────────────
-  socket.on('join', (payload) => {
-    const roomId = payload?.data?.live_room_id || payload?.data?.uuid;
-    if (!roomId) {
-      log('join 缺少 roomId', payload);
-      return;
-    }
-    socket.join(roomId);
-    if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-    rooms.get(roomId).add(socket.id);
-    log(`join → room:${roomId}, socket:${socket.id}`);
-
-    // 回复 joined
-    socket.emit('joined', {
-      request_id: payload.request_id,
-      time: Date.now(),
-      data: { live_room_id: roomId },
-    });
-  });
-
-  // ── billdDeskJoin：远程桌面客户端加入 ────────────────────────────────────
-  // 客户端发送格式：{ data: { deskUserUuid, deskUserPassword, live_room_id } }
+  // ── billdDeskJoin：被控端注册 ────────────────────────────────────────────
   socket.on('billdDeskJoin', (payload) => {
-    const d = payload.data || {};
-    // 兼容 uuid / deskUserUuid / live_room_id 三种字段名
-    const roomId = d.deskUserUuid || d.uuid || d.live_room_id;
-    if (!roomId) {
-      log('billdDeskJoin 缺少 roomId', JSON.stringify(d));
-      return;
-    }
-    socket.join(roomId);
-    if (!rooms.has(roomId)) rooms.set(roomId, new Set());
-    rooms.get(roomId).add(socket.id);
-    // 记录 deskUserUuid → socketId 映射，供 billdDeskStartRemote 路由用
-    socket._deskUserUuid = roomId;
-    uuidSocketMap.set(roomId, socket.id);
-    log(`billdDeskJoin → room:${roomId}, socket:${socket.id}`);
+    const d = unwrap(payload);
+    const uuid = d.deskUserUuid || d.uuid || d.live_room_id;
+    if (!uuid) { log('billdDeskJoin: 缺少 uuid', JSON.stringify(d)); return; }
 
-    socket.emit('billdDeskJoined', {
-      request_id: payload.request_id,
-      time: Date.now(),
-      data: { live_room_id: roomId, uuid: roomId },
-    });
+    uuidSocketMap.set(uuid, socket.id);
+    socket._deskUserUuid = uuid;
+    log(`billdDeskJoin uuid=${uuid} socket=${socket.id}`);
+
+    // 回复 billdDeskJoined（客户端 handler 只检查可选字段，格式宽松）
+    socket.emit('billdDeskJoined', { live_room_id: uuid, uuid });
   });
 
-  // ── billdDeskStartRemote：控制端发起连接请求 → 转发给被控端 ───────────────
-  // 客户端发送格式：{ data: { receiver: '', remoteDeskUserUuid, sender, ... } }
+  // ── billdDeskStartRemote：控制端发起连接 → 转发给被控端 ──────────────────
   socket.on('billdDeskStartRemote', (payload) => {
-    const d = payload.data || {};
+    const d = unwrap(payload);
     const targetUuid = d.remoteDeskUserUuid;
     const targetSocketId = uuidSocketMap.get(targetUuid);
-    log(`billdDeskStartRemote → remoteDeskUserUuid:${targetUuid} socketId:${targetSocketId}`);
+    log(`billdDeskStartRemote target=${targetUuid} found=${!!targetSocketId}`);
+
     if (!targetSocketId) {
-      // 被控端不在线，告知控制端
+      // 直接回复控制端：目标不在线
       socket.emit('billdDeskStartRemoteResult', {
-        request_id: payload.request_id,
-        time: Date.now(),
-        data: { code: 1, msg: '目标设备不在线', data: d },
+        code: 1,
+        msg: '目标设备不在线，请确认对方已打开 Mydesk',
+        data: d,
       });
       return;
     }
-    // 把请求转发给被控端，附上控制端的真实 socketId 作为 receiver
+    // 转发给被控端，附上控制端 socketId 作为 sender（被控端需要它回复）
     io.to(targetSocketId).emit('billdDeskStartRemote', {
-      ...payload,
-      data: { ...d, receiver: targetSocketId },
+      ...d,
+      sender: socket.id,       // 覆盖为真实 socketId
+      receiver: targetSocketId,
     });
   });
 
-  // ── billdDeskStartRemoteResult：被控端回复（接受/拒绝） → 转发给控制端 ────
+  // ── billdDeskStartRemoteResult：被控端回复 → 转发给控制端 ────────────────
   socket.on('billdDeskStartRemoteResult', (payload) => {
-    const d = payload.data || {};
-    // 控制端的 socketId 在 data.data.sender 里
+    const d = unwrap(payload);
+    // 被控端调用 denyPermission/allowPermission 时，data 结构：
+    // { code, msg, data: { sender: ctrlSocketId, receiver: mySocketId, ... } }
     const ctrlSocketId = d.data?.sender;
-    log(`billdDeskStartRemoteResult code:${d.code} → ctrlSocket:${ctrlSocketId}`);
+    log(`billdDeskStartRemoteResult code=${d.code} → ctrl=${ctrlSocketId}`);
+
     if (ctrlSocketId) {
-      io.to(ctrlSocketId).emit('billdDeskStartRemoteResult', payload);
+      io.to(ctrlSocketId).emit('billdDeskStartRemoteResult', d);
     }
-    // 同时也发给被控端自己（remote/index.vue 监听此事件更新 UI）
-    socket.emit('billdDeskStartRemoteResult', payload);
+    // 被控端自己也收到（更新 UI）
+    socket.emit('billdDeskStartRemoteResult', d);
   });
 
-  // ── billdDeskBehavior：鼠标/键盘行为 → 转发给被控端 ──────────────────────
-  socket.on('billdDeskBehavior', (payload) => {
-    const { receiver } = payload.data || {};
-    relayToRoom(receiver, 'billdDeskBehavior', payload, socket.id);
-  });
-
-  // ── WebRTC 信令三件套：offer / answer / candidate ────────────────────────
+  // ── WebRTC 信令：offer / answer / candidate ──────────────────────────────
+  // 转发内层 data，receiver 是 socketId
   socket.on('nativeWebRtcOffer', (payload) => {
-    const { receiver, live_room_id } = payload.data || {};
-    log(`nativeWebRtcOffer → receiver:${receiver}`);
-    relayToRoom(receiver || live_room_id, 'nativeWebRtcOffer', payload, socket.id);
+    const d = unwrap(payload);
+    log(`nativeWebRtcOffer → ${d.receiver}`);
+    if (d.receiver) io.to(d.receiver).emit('nativeWebRtcOffer', d);
   });
 
   socket.on('nativeWebRtcAnswer', (payload) => {
-    const { receiver, live_room_id } = payload.data || {};
-    log(`nativeWebRtcAnswer → receiver:${receiver}`);
-    relayToRoom(receiver || live_room_id, 'nativeWebRtcAnswer', payload, socket.id);
+    const d = unwrap(payload);
+    log(`nativeWebRtcAnswer → ${d.receiver}`);
+    if (d.receiver) io.to(d.receiver).emit('nativeWebRtcAnswer', d);
   });
 
   socket.on('nativeWebRtcCandidate', (payload) => {
-    const { receiver, live_room_id } = payload.data || {};
-    relayToRoom(receiver || live_room_id, 'nativeWebRtcCandidate', payload, socket.id);
+    const d = unwrap(payload);
+    if (d.receiver) io.to(d.receiver).emit('nativeWebRtcCandidate', d);
   });
 
-  // ── billdDeskOffer / Answer / Candidate（部分版本使用这组命名） ──────────
-  socket.on('billdDeskOffer', (payload) => {
-    const { receiver } = payload.data || {};
-    relayToRoom(receiver, 'billdDeskOffer', payload, socket.id);
-  });
-  socket.on('billdDeskAnswer', (payload) => {
-    const { receiver } = payload.data || {};
-    relayToRoom(receiver, 'billdDeskAnswer', payload, socket.id);
-  });
-  socket.on('billdDeskCandidate', (payload) => {
-    const { receiver } = payload.data || {};
-    relayToRoom(receiver, 'billdDeskCandidate', payload, socket.id);
+  // ── 鼠标/键盘行为 ────────────────────────────────────────────────────────
+  socket.on('billdDeskBehavior', (payload) => {
+    const d = unwrap(payload);
+    if (d.receiver) io.to(d.receiver).emit('billdDeskBehavior', d);
   });
 
-  // ── 文件传输信令（ft-*）：点对点转发 ───────────────────────────────────
-  // 所有文件传输信令消息结构：{ type: 'ft-xxx', to: targetUuid, from: myUuid, ... }
-  socket.on('fileTransfer', (payload) => {
-    const { to } = payload;
-    if (!to) return;
-    log(`fileTransfer ${payload.type} → ${to}`);
-    // 转发给目标 UUID 对应房间的所有成员
-    relayToRoom(to, 'fileTransfer', payload, socket.id);
+  // ── 通用 join（兼容） ─────────────────────────────────────────────────────
+  socket.on('join', (payload) => {
+    const d = unwrap(payload);
+    const roomId = String(d.live_room_id || '');
+    if (roomId) socket.join(roomId);
+    socket.emit('joined', {
+      request_id: payload.request_id,
+      time: Date.now(),
+      data: { live_room_id: d.live_room_id },
+    });
   });
 
-  // ftJoin：文件传输专用房间加入
-  socket.on('ftJoin', (payload) => {
-    const { uuid } = payload || {};
-    if (!uuid) return;
-    socket.join(uuid);
-    if (!rooms.has(uuid)) rooms.set(uuid, new Set());
-    rooms.get(uuid).add(socket.id);
-    log(`ftJoin → room:${uuid}`);
-  });
-
-  // ── heartbeat：保活 ────────────────────────────────────────────────────
+  // ── heartbeat ─────────────────────────────────────────────────────────────
   socket.on('heartbeat', (payload) => {
     socket.emit('heartbeat', { request_id: payload?.request_id, time: Date.now(), data: {} });
   });
 
-  // ── 断开处理 ───────────────────────────────────────────────────────────
+  // ── 断开 ──────────────────────────────────────────────────────────────────
   socket.on('disconnect', (reason) => {
-    log(`客户端断开: ${socket.id}, 原因: ${reason}`);
-    for (const [roomId, members] of rooms) {
-      if (members.delete(socket.id) && members.size === 0) {
-        rooms.delete(roomId);
-        log(`房间已清理: ${roomId}`);
-      }
-    }
-    if (socket._deskUserUuid) {
-      uuidSocketMap.delete(socket._deskUserUuid);
-    }
+    log(`[-] ${socket.id} reason=${reason}`);
+    if (socket._deskUserUuid) uuidSocketMap.delete(socket._deskUserUuid);
   });
 });
 
 httpServer.listen(PORT, () => {
-  log(`信令服务器启动在端口 ${PORT}`);
-  log(`健康检查: http://localhost:${PORT}/health`);
+  log(`信令服务器启动 port=${PORT}`);
 });
